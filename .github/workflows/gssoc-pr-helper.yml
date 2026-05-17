@@ -15,7 +15,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Process Pull Request
-        uses: actions/github-script@v9
+        uses: actions/github-script@v7
         with:
           script: |
             const prBody = context.payload.pull_request.body || "";
@@ -23,80 +23,110 @@ jobs:
             const creator = context.payload.pull_request.user.login;
 
             console.log(`Processing PR #${prNumber} opened by @${creator}`);
-            console.log(`PR Body excerpt: ${prBody.substring(0, 300)}...`);
 
-            // --- STEP 1: PARSE LINKED ISSUES ---
-            // Matches keywords like Closes #123, Fixes #123, Resolves #123, closes https://github.com/.../issues/123
-            const regex = /(?:closes|fixes|resolves|close|fix|resolve)\s+(?:https:\/\/github\.com\/[^\/]+\/[^\/]+\/issues\/|#\s*)(\d+)/gi;
-            let match;
-            const linkedIssues = new Set();
-            while ((match = regex.exec(prBody)) !== null) {
-              linkedIssues.add(parseInt(match[1], 10));
-            }
-
-            // Fallback: search for any #123 pattern in the description if no keywords were explicitly found
-            if (linkedIssues.size === 0) {
-              const simpleRegex = /#\s*(\d+)/g;
-              while ((match = simpleRegex.exec(prBody)) !== null) {
-                linkedIssues.add(parseInt(match[1], 10));
-              }
-            }
-
-            const issueNumbers = Array.from(linkedIssues);
+            // --- STEP 1: PARSE AND VALIDATE LINKED ISSUE ---
+            // Pattern to match: Closes #123, Fixes #123, Resolves #123, etc. (case-insensitive)
+            const issueRegex = /(?:closes|fixes|resolves)\s+#(\d+)/i;
+            const match = prBody.match(issueRegex);
+            
+            let linkedIssueNumber = null;
             let issueInfo = null;
-            let labelsToCopy = [];
             let levelLabel = null;
-
-            if (issueNumbers.length > 0) {
-              const issueNum = issueNumbers[0];
-              console.log(`Extracted potential linked issue: #${issueNum}`);
+            
+            if (match) {
+              linkedIssueNumber = parseInt(match[1], 10);
+              console.log(`Found linked issue reference: #${linkedIssueNumber}`);
+              
               try {
-                const issueResponse = await github.rest.issues.get({
+                // Fetch details of the linked issue
+                const { data: issue } = await github.rest.issues.get({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  issue_number: issueNum
+                  issue_number: linkedIssueNumber
                 });
                 
-                const issue = issueResponse.data;
-                // Verify it's an issue and not another pull request
-                if (issue && !issue.pull_request) {
-                  console.log(`Successfully verified linked Issue #${issueNum}`);
-                  issueInfo = issue;
+                issueInfo = issue;
+                console.log(`Linked issue verified: "${issue.title}"`);
+                
+                // Extract GSSOC labels from the issue
+                const issueLabels = issue.labels.map(l => typeof l === 'string' ? l : l.name);
+                console.log(`Issue labels: ${JSON.stringify(issueLabels)}`);
+                
+                // Identify the level difficulty label (e.g., level:beginner)
+                levelLabel = issueLabels.find(l => l.startsWith('level:'));
+                
+                if (levelLabel) {
+                  console.log(`Identified GSSOC level label from issue: ${levelLabel}`);
                   
-                  const issueLabels = issue.labels.map(l => l.name);
-                  console.log(`Issue labels found:`, issueLabels);
+                  // Copy tracking and level labels to the PR
+                  const labelsToCopy = issueLabels.filter(l => 
+                    l === 'gssoc' || 
+                    l === 'gssoc2026' || 
+                    l.startsWith('level:')
+                  );
                   
-                  const levels = ['level:beginner', 'level:intermediate', 'level:advanced', 'level:critical'];
-                  const standardTags = ['gssoc', 'gssoc2026'];
-                  
-                  for (const label of issueLabels) {
-                    if (levels.includes(label)) {
-                      levelLabel = label;
-                      labelsToCopy.push(label);
-                    }
-                    if (standardTags.includes(label)) {
-                      labelsToCopy.push(label);
-                    }
+                  if (labelsToCopy.length > 0) {
+                    console.log(`Applying labels to PR #${prNumber}: ${JSON.stringify(labelsToCopy)}`);
+                    await github.rest.issues.addLabels({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: prNumber,
+                      labels: labelsToCopy
+                    });
                   }
+                } else {
+                  console.log("No 'level:*' label found on the linked issue.");
                 }
-              } catch (err) {
-                console.error(`Could not retrieve details for issue #${issueNum}:`, err.message);
+              } catch (error) {
+                console.error(`Error processing linked issue #${linkedIssueNumber}:`, error.message);
               }
+            } else {
+              console.log("No linked issue found in the PR description.");
             }
 
-            // --- STEP 2: AUTO-APPLY LABELS FROM ISSUE ---
-            if (labelsToCopy.length > 0) {
-              console.log(`Auto-copying labels to PR #${prNumber}:`, labelsToCopy);
-              try {
+            // --- STEP 2: PARSE FILE CHANGES TO APPLY STACKABLE TYPE TAGS ---
+            try {
+              const { data: files } = await github.rest.pulls.listFiles({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              
+              const typeLabels = new Set();
+              
+              for (const file of files) {
+                const filename = file.filename;
+                if (filename.startsWith('frontend/')) {
+                  if (filename.includes('eslint') || filename.includes('tsconfig') || filename.includes('package.json')) {
+                    typeLabels.add('type:devops');
+                  } else {
+                    typeLabels.add('type:feature');
+                  }
+                } else if (filename.startsWith('backend/')) {
+                  if (filename.includes('test_') || filename.includes('pytest')) {
+                    typeLabels.add('type:testing');
+                  } else {
+                    typeLabels.add('type:feature');
+                  }
+                } else if (filename.endsWith('.md')) {
+                  typeLabels.add('type:docs');
+                } else if (filename.includes('.github/workflows/')) {
+                  typeLabels.add('type:devops');
+                }
+              }
+              
+              const typeLabelsArray = Array.from(typeLabels);
+              if (typeLabelsArray.length > 0) {
+                console.log(`Applying stackable type labels based on file analysis: ${JSON.stringify(typeLabelsArray)}`);
                 await github.rest.issues.addLabels({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: prNumber,
-                  labels: labelsToCopy
+                  labels: typeLabelsArray
                 });
-              } catch (err) {
-                console.error(`Failed to apply labels to PR #${prNumber}:`, err.message);
               }
+            } catch (error) {
+              console.error("Failed to analyze file changes or apply stackable labels:", error.message);
             }
 
             // --- STEP 3: BUILD IMMERSIVE SCORING COMMENT ---
@@ -109,68 +139,74 @@ jobs:
                 'level:critical': '80 pts'
               }[levelLabel] || '20 pts';
               
-              issueStatusMarkdown = `### 🔗 Linked Issue Verified!
-- **Issue**: [#${issueInfo.number}](${issueInfo.html_url}) — *${issueInfo.title}*
-- **GSSOC 2026 Difficulty**: \`${levelLabel || 'level:beginner'}\` (**${points}** base difficulty points upon merge!)
-- **Status**: We have automatically synced and copied the **${levelLabel || 'level:beginner'}** difficulty label to this PR!`;
+              issueStatusMarkdown = [
+                `### 🔗 Linked Issue Verified!`,
+                `- **Issue**: [#${issueInfo.number}](${issueInfo.html_url}) — *${issueInfo.title}*`,
+                `- **GSSOC 2026 Difficulty**: \`${levelLabel || 'level:beginner'}\` (**${points}** base difficulty points upon merge!)`,
+                `- **Status**: We have automatically synced and copied the **${levelLabel || 'level:beginner'}** difficulty label to this PR!`
+              ].join('\n');
             } else {
-              issueStatusMarkdown = `### ⚠️ Warning: Linked Issue Missing!
-We couldn't detect a valid assigned issue linked in your PR description.
-To receive points for **GSSOC 2026**, your PR **must** link to your assigned issue.
-- **How to fix**: Edit your PR description to add \`Closes #123\` (replace \`123\` with your assigned issue number) under the **Related Issue** section.
-- *Once linked, our automated systems will synchronize the score level!*`;
+              issueStatusMarkdown = [
+                `### ⚠️ Warning: Linked Issue Missing!`,
+                `We couldn't detect a valid assigned issue linked in your PR description.`,
+                `To receive points for **GSSOC 2026**, your PR **must** link to your assigned issue.`,
+                `- **How to fix**: Edit your PR description to add \`Closes #123\` (replace \`123\` with your assigned issue number) under the **Related Issue** section.`,
+                `- *Once linked, our automated systems will synchronize the score level!*`
+              ].join('\n');
             }
 
-            const commentBody = `## 🎨 Welcome to VISUALAIZE Pro, @${creator}! 🚀
+            const commentBody = [
+              `## 🎨 Welcome to VISUALAIZE Pro, @${creator}! 🚀`,
+              ``,
+              `Thank you for opening this pull request and helping us build the future of diagram visualization! We are thrilled to have you participating in **GirlScript Summer of Code (GSSOC) 2026**!`,
+              ``,
+              issueStatusMarkdown,
+              ``,
+              `---`,
+              ``,
+              `### 🏆 GSSOC 2026 PR Labels Cheat-sheet`,
+              ``,
+              `Use this quick-reference guide to check the scoring and labeling status of your pull request:`,
+              ``,
+              `| Category | Available Labels | Description |`,
+              `| :--- | :--- | :--- |`,
+              `| **Difficulty** <br>*(Required, Pick One)* | \`level:beginner\` (20 pts) <br>\`level:intermediate\` (35 pts) <br>\`level:advanced\` (55 pts) <br>\`level:critical\` (80 pts) | Copied automatically from your linked issue. |`,
+              `| **Quality** <br>*(Optional Multiplier)* | \`quality:clean\` <br>\`quality:exceptional\` | Mentors can apply these for outstanding, clean contributions. |`,
+              `| **Type** <br>*(Optional Stackable)* | \`type:bug\`, \`type:feature\`, \`type:docs\`, \`type:testing\`, \`type:security\`, \`type:performance\`, \`type:design\`, \`type:refactor\`, \`type:devops\`, \`type:accessibility\` | Optional tags reflecting the type of files modified. |`,
+              ``,
+              `### 📊 Score Calculation Formula`,
+              `\`Score = 50 + (Difficulty Base × Quality Multiplier) + Type Bonus\``,
+              ``,
+              `📌 **Crucial Rules for Merging:**`,
+              `- ⭐️ **\`gssoc:approved\`** gives **+50 base points** and is **required on every PR** — without it, the contribution will not count.`,
+              `- 🧑‍🏫 Mentors must add **\`mentor:username\`** to PRs they reviewed to receive attribution points.`,
+              `- 🔄 Project data, PR contributions, and leaderboards refresh once daily at **3:30–4:30 AM IST**. Allow 24–48 hours after merge for points to appear.`,
+              ``,
+              `*Keep up the excellent work, and happy coding!* 💻✨`,
+              ``,
+              `<!-- gssoc-pr-helper-signature -->`
+            ].join('\n');
 
-Thank you for opening this pull request and helping us build the future of diagram visualization! We are thrilled to have you participating in **GirlScript Summer of Code (GSSOC) 2026**!
-
-${issueStatusMarkdown}
-
----
-
-### 🏆 GSSOC 2026 PR Labels Cheat-sheet
-
-Use this quick-reference guide to check the scoring and labeling status of your pull request:
-
-| Category | Available Labels | Description |
-| :--- | :--- | :--- |
-| **Difficulty** <br>*(Required, Pick One)* | \`level:beginner\` (20 pts) <br>\`level:intermediate\` (35 pts) <br>\`level:advanced\` (55 pts) <br>\`level:critical\` (80 pts) | Copied automatically from your linked issue. |
-| **Quality** <br>*(Optional Multiplier)* | \`quality:clean\` <br>\`quality:exceptional\` | Mentors can apply these for outstanding, clean contributions. |
-| **Type** <br>*(Optional Stackable)* | \`type:bug\`, \`type:feature\`, \`type:docs\`, \`type:testing\`, \`type:security\`, \`type:performance\`, \`type:design\`, \`type:refactor\`, \`type:devops\`, \`type:accessibility\` | Optional tags reflecting the type of files modified. |
-
-### 📊 Score Calculation Formula
-\`Score = 50 + (Difficulty Base × Quality Multiplier) + Type Bonus\`
-
-📌 **Crucial Rules for Merging:**
-- ⭐️ **\`gssoc:approved\`** gives **+50 base points** and is **required on every PR** — without it, the contribution will not count.
-- 🧑‍🏫 Mentors must add **\`mentor:username\`** to PRs they reviewed to receive attribution points.
-- 🔄 Project data, PR contributions, and leaderboards refresh once daily at **3:30–4:30 AM IST**. Allow 24–48 hours after merge for points to appear.
-
-*Keep up the excellent work, and happy coding!* 💻✨
-
-<!-- gssoc-pr-helper-signature -->`;
-
-            // --- STEP 4: PREVENT SPAM (UPSERT COMMENT) ---
+            // --- STEP 4: CHECK AND POST WELCOME COMMENT ---
             try {
-              const commentsResponse = await github.rest.issues.listComments({
+              const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: prNumber
               });
-
-              const botComment = commentsResponse.data.find(c => c.body.includes('<!-- gssoc-pr-helper-signature -->'));
-
-              if (botComment) {
-                console.log("Updating existing welcome comment.");
+              
+              const existingWelcomeComment = comments.find(c => c.body.includes('gssoc-pr-helper-signature'));
+              
+              if (existingWelcomeComment) {
+                console.log("Updating existing welcome comment...");
                 await github.rest.issues.updateComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  comment_id: botComment.id,
+                  comment_id: existingWelcomeComment.id,
                   body: commentBody
                 });
               } else {
-                console.log("Posting new welcome comment.");
+                console.log("Posting fresh welcome comment...");
                 await github.rest.issues.createComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -178,6 +214,6 @@ Use this quick-reference guide to check the scoring and labeling status of your 
                   body: commentBody
                 });
               }
-            } catch (err) {
-              console.error("Failed to upsert welcome comment:", err.message);
+            } catch (error) {
+              console.error("Failed to post or update GSSOC welcome comment:", error.message);
             }
