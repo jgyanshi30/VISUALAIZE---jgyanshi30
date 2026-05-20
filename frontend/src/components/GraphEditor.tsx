@@ -195,6 +195,7 @@ const ZeroState = ({ onSelect }: { onSelect: (text: string) => void }) => {
 function EditorContent({ onBack }: EditorProps) {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [edges, setEdges] = useState<Edge[]>([]);
+  const [viewport, setViewport] = useState({ x: 0, y: 0, zoom: 1 });
   const [prompt, setPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [graphData, setGraphData] = useState<GraphData | null>(null);
@@ -213,11 +214,25 @@ function EditorContent({ onBack }: EditorProps) {
   const codeCache = useRef(new Map<string, codeObject>());
   const reactFlowWrapper = useRef(null);
   const fileInputRef = useRef<HTMLInputElement>(null); 
-  const { getNodes } = useReactFlow(); 
+  const { getViewport } = useReactFlow();
 
-  const nodeTypes = useMemo(() => ({ default: CustomNode, input: CustomNode, output: CustomNode }), []);
+ const nodeTypes = useMemo(() => ({
+  custom: CustomNode,
+}), []);
+
+  const edgeTypes = useMemo(() => ({}), []);
   const onNodesChange: OnNodesChange = useCallback((changes) => setNodes((nds) => applyNodeChanges(changes, nds)), []);
   const onEdgesChange: OnEdgesChange = useCallback((changes) => setEdges((eds) => applyEdgeChanges(changes, eds)), []);
+
+  const rafRef = useRef<number | null>(null);
+
+  const onMove = useCallback((_: any, vp: any) => {
+  if (rafRef.current) cancelAnimationFrame(rafRef.current);
+
+  rafRef.current = requestAnimationFrame(() => {
+    setViewport(vp);
+  });
+}, []);
 
   const generateGraph = async (text: string) => {
     if (!text || isGenerating) return;
@@ -253,11 +268,11 @@ function EditorContent({ onBack }: EditorProps) {
       codeCache.current.set(codeLanguage, {code_snippet: data.code_snippet ?? '', code_explanation: data.code_explanation ?? ''});
       
       const rawNodes: Node[] = data.nodes.map((n: { id: string; label: string }) => ({
-        id: n.id, type: 'default', data: { label: n.label }, position: { x: 0, y: 0 },
+        id: n.id, type: 'custom', data: { label: n.label }, position: { x: 0, y: 0 },
         style: { background: 'transparent', border: 'none', boxShadow: 'none', width: 'auto' },
       }));
       const rawEdges: Edge[] = data.edges.map((e: { source: string; target: string; label: string }, i: number) => ({
-        id: `e-${i}`, source: e.source, target: e.target, label: e.label, type: 'bezier', animated: true,
+        id: `e-${i}`, source: e.source, target: e.target, label: e.label, type: 'default', animated: true,
         markerEnd: { type: MarkerType.ArrowClosed, color: '#60a5fa' },
         style: { stroke: '#3b82f6', strokeWidth: 2, filter: 'drop-shadow(0 0 3px #3b82f6)' },
         labelStyle: { fill: '#93c5fd', fontWeight: 700 }
@@ -265,6 +280,9 @@ function EditorContent({ onBack }: EditorProps) {
       const { nodes: layoutedNodes, edges: layoutedEdges } = getLayoutedElements(rawNodes, rawEdges);
       setNodes(layoutedNodes);
       setEdges(layoutedEdges);
+      console.log("RAW BACKEND DATA:", data.nodes, data.edges);
+      console.log("LAYOUTED NODES:", layoutedNodes.length);
+      console.log("LAYOUTED EDGES:", layoutedEdges.length);
       setIsSidebarOpen(true); 
 
     } catch (err) {
@@ -355,7 +373,51 @@ function EditorContent({ onBack }: EditorProps) {
     }
   };
 
+
   const showBackground = nodes.length === 0;
+  console.log("REACT STATE CHECK -> nodes:", nodes.length, "edges:", edges.length);
+
+  const { x, y, zoom } = getViewport();
+
+  const buffer = 500;
+
+  // Performance optimization: render only nodes within viewport bounds
+// to reduce rendering cost for large graphs
+
+const visibleNodes = useMemo(() => {
+  const vp = getViewport();
+  const { x, y, zoom } = vp;
+
+  return nodes.filter((node) => {
+    const screenX = node.position.x * zoom + x;
+    const screenY = node.position.y * zoom + y;
+
+    return (
+      screenX > -buffer &&
+      screenX < window.innerWidth + buffer &&
+      screenY > -buffer &&
+      screenY < window.innerHeight + buffer
+    );
+  });
+}, [nodes, viewport]);
+
+const visibleNodeIds = useMemo(() => {
+  return new Set(visibleNodes.map(n => n.id));
+}, [visibleNodes]);
+
+const filteredEdges = useMemo(() => {
+  return edges.filter(
+    (e) => visibleNodeIds.has(e.source) && visibleNodeIds.has(e.target)
+  );
+}, [edges, visibleNodeIds]);
+
+console.log(
+  "TOTAL:", nodes.length,
+  "VISIBLE:", visibleNodes.length
+);
+  console.log("VISIBLE CHECK:", visibleNodes.length);
+
+  console.log("VIEWPORT:", getViewport());
 
   return (
     <div className="relative flex h-screen w-screen bg-black overflow-hidden font-sans text-slate-200">
@@ -402,7 +464,7 @@ function EditorContent({ onBack }: EditorProps) {
 
         {/* MAIN GRAPH AREA */}
         <div className="flex-1 w-full h-full">
-            <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} fitView minZoom={0.1}>
+            <ReactFlow nodes={visibleNodes} edges={filteredEdges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onMove={onMove} fitView minZoom={0.1}>
                 <Background color="#94a3b8" gap={40} size={1} variant={BackgroundVariant.Dots} className="opacity-[0.1]" />
                 <Controls /> 
                 <MiniMap className="!bg-slate-900/80 !backdrop-blur-md !border-slate-800 rounded-lg" nodeColor="#3b82f6" maskColor="rgba(15, 23, 42, 0.6)" />
