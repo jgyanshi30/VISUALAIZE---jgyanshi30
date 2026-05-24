@@ -201,7 +201,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 client_id = data["clientId"]
 
             if data["type"] == "CURSOR_MOVE":
-    room_id = data["roomId"]
+                room_id = data["roomId"]
 
     for client in connected_clients[room_id]:
         if client != websocket:
